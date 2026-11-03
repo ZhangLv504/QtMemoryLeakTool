@@ -17,13 +17,14 @@
 #include "MemTrackerConfig.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <new>
 
-// 平台差异只涉及线程/进程 ID 与对齐分配函数，均封装在本文件内部，
+// 平台差异只涉及线程/进程 ID、对齐分配函数与目录创建，均封装在本文件内部，
 // 不影响公开头文件。windows.h 只出现在实现 TU，避免污染调用方。
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -32,11 +33,13 @@
 #  ifndef NOMINMAX
 #    define NOMINMAX
 #  endif
+#  include <direct.h>
 #  include <malloc.h>
 #  include <process.h>
 #  include <windows.h>
 #else
 #  include <pthread.h>
+#  include <sys/stat.h>
 #  include <unistd.h>
 #endif
 
@@ -92,13 +95,23 @@ std::atomic<std::uint64_t> g_totalAllocations{0};
 std::atomic<std::uint64_t> g_unknownFrees{0};
 std::atomic<std::uint64_t> g_tableOverflows{0};
 
-// 以下两个状态只允许在持有 g_lock 时读写。
+// 以下状态只允许在持有 g_lock 时读写。
 std::uint64_t g_seq = 0;
 bool g_atexitRegistered = false;
 
-// 默认日志路径。setLogPath 复制新值，dump 在锁内复制一份再打开文件，
-// 避免路径指针在写盘期间被其他线程改写。
+// 显式日志路径：setLogPath/start(path) 设置后进入显式模式，优先于自动布局。
+// 路径在锁内复制进静态缓冲，落盘时先复制再 fopen，避免被并发改写。
 char g_logPath[MEMTRACK_PATH_MAX] = "memtrack_leaks.log";
+bool g_logPathExplicit = false;
+
+// 自动布局状态：首次自动 start() 解析出本次进程的运行目录后 g_runDir 有效。
+// stop()/start() 复用同一目录；时间戳只在创建时取一次。
+char g_phaseName[MEMTRACK_PHASE_MAX] = "default";
+char g_runDir[MEMTRACK_PATH_MAX] = {};
+bool g_runDirReady = false;
+
+// 手动 dump 序号，锁内自增，保证同一次运行内的 manual-N.log 互不覆盖。
+std::uint32_t g_manualSeq = 0;
 
 // 每个线程记录“当前是否已在跟踪器内部”。>0 时再次触发全局 new/delete
 // （例如 CRT 内部异常路径）必须直接透传，既避免递归，也避免同线程自锁。
@@ -435,8 +448,8 @@ void* newNoThrow(std::size_t size, std::size_t align, const char* file, int line
     return rawAlloc(size, align);
 }
 
-// 生成 ISO 8601 本地时间（秒精度）。失败时输出空串，日志仍可写出。
-void formatTimestamp(char* buffer, std::size_t capacity) noexcept
+// 生成本地时间字符串。失败时输出空串，调用方按“无时间戳”处理。
+void formatLocalTime(const char* format, char* buffer, std::size_t capacity) noexcept
 {
     std::time_t now = std::time(nullptr);
     std::tm local{};
@@ -455,17 +468,121 @@ void formatTimestamp(char* buffer, std::size_t capacity) noexcept
     }
 #endif
 
-    if (std::strftime(buffer, capacity, "%Y-%m-%dT%H:%M:%S", &local) == 0u)
+    if (std::strftime(buffer, capacity, format, &local) == 0u)
     {
         buffer[0] = '\0';
     }
 }
 
-// 在锁内整体复制默认路径，锁外再用于 fopen，避免路径被并发改写。
-void copyLogPath(char* out) noexcept
+// 日志头部使用的 ISO 8601 时间（秒精度）。
+void formatTimestamp(char* buffer, std::size_t capacity) noexcept
 {
-    SpinLock lock;
-    std::memcpy(out, g_logPath, MEMTRACK_PATH_MAX);
+    formatLocalTime("%Y-%m-%dT%H:%M:%S", buffer, capacity);
+}
+
+// 运行目录名使用的时间戳：紧凑、无分隔歧义，便于目录排序。
+void formatRunStamp(char* buffer, std::size_t capacity) noexcept
+{
+    formatLocalTime("%Y%m%d-%H%M%S", buffer, capacity);
+}
+
+// 创建单级目录；已存在视为成功。只使用 CRT 的 _mkdir/mkdir（内部走 malloc/OS），
+// 不触发被重载的 operator new。调用方负责保证父目录已经创建。
+bool ensureDirectory(const char* path) noexcept
+{
+#if defined(_WIN32)
+    if (::_mkdir(path) == 0)
+    {
+        return true;
+    }
+#else
+    if (::mkdir(path, 0755) == 0)
+    {
+        return true;
+    }
+#endif
+    return errno == EEXIST;
+}
+
+// 规划并创建本次运行的日志目录：
+//   <MEMTRACK_LOG_ROOT>/<phase>/<yyyyMMdd-HHmmss>_pid<pid>/
+// 时间取首次 start 的时刻，pid 用于区分同一秒启动的多个进程。
+// 全程只用静态缓冲 + snprintf + mkdir，不分配内存。
+// 返回 false 表示路径拼接溢出或目录创建失败，调用方应放弃开启跟踪。
+bool prepareRunDirectory(const char* phase, char* runDir, std::size_t capacity) noexcept
+{
+    char stamp[32];
+    formatRunStamp(stamp, sizeof(stamp));
+    if (stamp[0] == '\0')
+    {
+        return false;
+    }
+
+    char rootDir[MEMTRACK_PATH_MAX];
+    char phaseDir[MEMTRACK_PATH_MAX];
+    const int rootLen = std::snprintf(rootDir, sizeof(rootDir), "%s", MEMTRACK_LOG_ROOT);
+    const int phaseLen = std::snprintf(phaseDir, sizeof(phaseDir), "%s/%s",
+                                       MEMTRACK_LOG_ROOT, phase);
+    const int runLen = std::snprintf(runDir, capacity, "%s/%s/%s_pid%ld",
+                                     MEMTRACK_LOG_ROOT, phase, stamp, currentProcessId());
+
+    if (rootLen <= 0 || static_cast<std::size_t>(rootLen) >= sizeof(rootDir)
+        || phaseLen <= 0 || static_cast<std::size_t>(phaseLen) >= sizeof(phaseDir)
+        || runLen <= 0 || static_cast<std::size_t>(runLen) >= capacity)
+    {
+        return false;
+    }
+
+    return ensureDirectory(rootDir)
+        && ensureDirectory(phaseDir)
+        && ensureDirectory(runDir);
+}
+
+// 解析一次默认落盘的目标路径。
+// - 显式路径模式：返回 setLogPath/start(path) 设置的路径（可能覆盖旧文件）；
+// - 自动模式：atexit 用 <runDir>/run.log，手动 dump 用 <runDir>/manual-N.log；
+// - 自动目录尚未初始化（未 start 且无显式路径）：回退到旧默认文件。
+// 路径状态在锁内复制，snprintf 在锁外执行；锁内不做 IO。
+bool buildDefaultDumpPath(char* out, std::size_t capacity, bool manual) noexcept
+{
+    char runDir[MEMTRACK_PATH_MAX];
+    char explicitPath[MEMTRACK_PATH_MAX];
+    std::uint32_t seq = 0;
+    bool useRunDir = false;
+
+    {
+        SpinLock lock;
+        if (!g_logPathExplicit && g_runDirReady)
+        {
+            std::memcpy(runDir, g_runDir, sizeof(runDir));
+            useRunDir = true;
+            if (manual)
+            {
+                seq = ++g_manualSeq;
+            }
+        }
+        else
+        {
+            std::memcpy(explicitPath, g_logPath, sizeof(explicitPath));
+        }
+    }
+
+    int written = 0;
+    if (!useRunDir)
+    {
+        written = std::snprintf(out, capacity, "%s", explicitPath);
+        return written > 0 && static_cast<std::size_t>(written) < capacity;
+    }
+
+    if (manual)
+    {
+        written = std::snprintf(out, capacity, "%s/manual-%u.log", runDir, seq);
+    }
+    else
+    {
+        written = std::snprintf(out, capacity, "%s/run.log", runDir);
+    }
+    return written > 0 && static_cast<std::size_t>(written) < capacity;
 }
 
 // 日志落盘。格式契约见 PROJECT_PROGRESS.md 第 8 节：头部键序固定、每条块
@@ -554,7 +671,10 @@ void atExitDump() noexcept
     }
 
     char path[MEMTRACK_PATH_MAX];
-    copyLogPath(path);
+    if (!buildDefaultDumpPath(path, sizeof(path), false))
+    {
+        return;
+    }
     dumpToFile(path, "atexit");
 #endif
 }
@@ -715,6 +835,45 @@ bool setLogPath(const char* path) noexcept
 
     SpinLock lock;
     std::memcpy(g_logPath, path, length + 1u);
+    // 显式路径优先于自动布局；之后不再创建 logs/<phase>/... 目录。
+    g_logPathExplicit = true;
+    return true;
+}
+
+bool setPhaseName(const char* phase) noexcept
+{
+    if (phase == nullptr)
+    {
+        return false;
+    }
+
+    const std::size_t length = std::strlen(phase);
+    if (length == 0u || length >= MEMTRACK_PHASE_MAX)
+    {
+        return false;
+    }
+    if (std::strcmp(phase, ".") == 0 || std::strcmp(phase, "..") == 0)
+    {
+        return false;
+    }
+
+    // 只允许单段目录名，避免通过阶段名跳出 logs 根目录。
+    for (std::size_t i = 0; i < length; ++i)
+    {
+        const char c = phase[i];
+        if (c == '/' || c == '\\' || c == ':'
+            || static_cast<unsigned char>(c) < 0x20u)
+        {
+            return false;
+        }
+    }
+
+    SpinLock lock;
+    if (g_runDirReady)
+    {
+        return false;
+    }
+    std::memcpy(g_phaseName, phase, length + 1u);
     return true;
 }
 
@@ -723,6 +882,35 @@ bool start(const char* logPath) noexcept
     if (logPath != nullptr && !setLogPath(logPath))
     {
         return false;
+    }
+
+    // 自动布局：首次自动 start 时创建运行目录。目录创建是配置阶段的唯一 IO，
+    // 放在启用记录之前且不持表锁；失败则不开启跟踪，避免产生无处落盘的记录。
+    bool needAutoDirectory = false;
+    char phase[MEMTRACK_PHASE_MAX];
+    {
+        SpinLock lock;
+        if (!g_logPathExplicit && !g_runDirReady)
+        {
+            std::memcpy(phase, g_phaseName, sizeof(phase));
+            needAutoDirectory = true;
+        }
+    }
+
+    if (needAutoDirectory)
+    {
+        char runDir[MEMTRACK_PATH_MAX];
+        if (!prepareRunDirectory(phase, runDir, sizeof(runDir)))
+        {
+            return false;
+        }
+
+        SpinLock lock;
+        if (!g_runDirReady && !g_logPathExplicit)
+        {
+            std::memcpy(g_runDir, runDir, sizeof(g_runDir));
+            g_runDirReady = true;
+        }
     }
 
     g_enabled.store(true, std::memory_order_release);
@@ -789,7 +977,10 @@ int dumpLeaks(const char* path) noexcept
     }
     else
     {
-        copyLogPath(resolved);
+        if (!buildDefaultDumpPath(resolved, sizeof(resolved), true))
+        {
+            return -1;
+        }
     }
 
     return dumpToFile(resolved, "manual");

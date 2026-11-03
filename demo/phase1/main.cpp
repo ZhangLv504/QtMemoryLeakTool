@@ -5,9 +5,9 @@
 // 用途：按 PROJECT_PROGRESS.md 第 11 节的验收场景制造泄漏，校验 Stats 与
 //       日志文件，正常时输出 PASS 并以退出码 0 结束。
 //
-// 预期产出（详见各场景注释）：
-// - 手动日志 memtrack_manual.log：5 条块记录，dump_reason=manual；
-// - 退出日志 memtrack_leaks.log：5 条块记录，dump_reason=atexit；
+// 预期产出（相对进程当前工作目录）：
+// - logs/phase1/<yyyyMMdd-HHmmss>_pid<pid>/manual-1.log：5 条块，dump_reason=manual；
+// - 同一运行目录下 run.log：5 条块，dump_reason=atexit；
 // - 统计值：live_blocks=5、live_bytes=128、unknown_frees=1、table_overflows=0。
 //
 // 本文件使用 printf 而不是 iostream：iostream 的静态初始化会在跟踪器启动前
@@ -54,7 +54,14 @@ void leakInWorker()
 
 int main()
 {
-    // 使用默认日志路径 memtrack_leaks.log；start 同时布防 atexit 自动落盘。
+    // 阶段目录名必须在首次 start 前设置；start 会自动创建
+    // logs/phase1/<时间戳>_pid<pid>/ 并布防 atexit 自动落盘到该目录的 run.log。
+    if (!memtrack::setPhaseName("phase1"))
+    {
+        std::printf("memtrack::setPhaseName failed\n");
+        return 2;
+    }
+
     if (!memtrack::start())
     {
         std::printf("memtrack::start failed\n");
@@ -90,9 +97,9 @@ int main()
     memtrack::start();
     destroyUntrackedBlock(untracked);
 
-    // 场景六：手动导出。预期返回 5（上述 5 个泄漏块），
-    // memtrack_manual.log 的 dump_reason=manual，且不影响跟踪状态。
-    const int manualRows = memtrack::dumpLeaks("memtrack_manual.log");
+    // 场景六：手动导出。预期返回 5（上述 5 个泄漏块），写入本次运行目录的
+    // manual-1.log（dump_reason=manual），且不影响跟踪状态。
+    const int manualRows = memtrack::dumpLeaks();
 
     // 场景七：统计自校验。各字段与验收表一致才算通过；
     // 失败时退出码非 0，便于 CI/人工快速发现回归。
@@ -114,7 +121,7 @@ int main()
 
     std::printf(ok ? "PASS\n" : "FAIL\n");
 
-    // main 返回后 atexit 处理器再写一份 memtrack_leaks.log（dump_reason=atexit），
+    // main 返回后 atexit 处理器再写一份 run.log（dump_reason=atexit），
     // 内容应与手动日志的 5 条块记录一致。
     return ok ? 0 : 1;
 }

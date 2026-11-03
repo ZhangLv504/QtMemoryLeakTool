@@ -34,11 +34,14 @@ struct Stats
 };
 
 // 开启跟踪并准备自动落盘。
-// logPath：可选日志路径，nullptr 使用当前默认路径；非空时等价于先调用
-//          setLogPath。路径为空或超长时直接返回 false 且不改变原有开关状态。
-// 返回：true 表示已开启；false 仅由路径参数非法导致。
+// logPath：可选显式日志路径，nullptr 时启用自动布局
+//          <MEMTRACK_LOG_ROOT>/<phase>/<yyyyMMdd-HHmmss>_pid<pid>/（见文档 8.1）；
+//          非空时等价于先调用 setLogPath 并进入显式路径模式。
+// 返回：true 表示已开启；false 表示路径非法或自动目录创建失败（此时不开启记录）。
 // 调用约束：幂等；首次调用注册 atexit 处理器，之后 stop()/start() 只切换
-//           记录开关并重新布防自动落盘，不会重复注册。本函数不分配内存。
+//           记录开关并重新布防自动落盘，不会重复注册；自动运行目录在首次
+//           自动 start 时创建，之后 stop()/start() 复用同一目录。
+//           本函数不分配内存；目录创建应在工作线程开始分配前完成。
 bool start(const char* logPath = nullptr) noexcept;
 
 // 暂停分配记录，并取消本次运行的自动落盘；已记录的块保留，之后调用
@@ -46,20 +49,30 @@ bool start(const char* logPath = nullptr) noexcept;
 // 假泄漏。本函数不分配内存。
 void stop() noexcept;
 
-// 设置默认日志路径（同时用于 atexit 自动落盘和 dumpLeaks 的默认目标）。
+// 设置显式日志路径。一旦设置，atexit 自动落盘与 dumpLeaks(nullptr) 都写到
+// 该路径，自动目录布局不再生效（多次 dump 会覆盖同一文件）。
 // path：非空 C 字符串；长度必须小于 MEMTRACK_PATH_MAX。
 // 返回：true 表示已复制进静态缓冲；false 表示参数为空或超长，原路径不变。
 // 线程安全：与落盘读取路径共用一把自旋锁，只做内存复制，不做 IO。
 bool setLogPath(const char* path) noexcept;
 
+// 设置自动布局的阶段目录名（如 "phase1"/"phase2"），默认 "default"。
+// 约束：必须在首次自动 start()（创建运行目录）之前调用；仅允许单段目录名：
+//       非空、长度 < MEMTRACK_PHASE_MAX、不含 '/' '\' ':'、不是 "." 或 ".."。
+// 返回：false 表示参数非法，或自动运行目录已经初始化（阶段名不再生效）。
+// 显式日志路径模式下阶段名不参与落盘，但本函数仍可在目录初始化前设置成功。
+bool setPhaseName(const char* phase) noexcept;
+
 // 读取计数快照。无锁读取原子计数，内部不分配内存，可在任意线程调用。
 Stats stats() noexcept;
 
 // 将当前存活块快照写入日志文件。
-// path：可选目标路径，nullptr 使用 setLogPath/start 设置的默认路径；
+// path：可选目标路径。nullptr 时写入自动运行目录：atexit 用 run.log，
+//       手动调用依次使用 manual-1.log、manual-2.log…（同一次运行不覆盖）；
+//       未 start 且无显式路径时回退到 memtrack_leaks.log。
 //       空串或超长返回 -1。
 // 返回：写出的块记录条数；文件无法打开（目录不存在、无权限等）返回 -1。
-// 副作用：不修改跟踪状态、不清空记录；同一路径重复调用会覆盖旧文件。
+// 副作用：不修改跟踪状态、不清空记录；显式路径重复调用会覆盖旧文件。
 // 调用约束：内部逐槽加锁复制、锁外写盘，可与分配并发；但多个线程同时以
 //           同一路径落盘时输出会互相覆盖，调用方应自行串行化 dump 调用。
 int dumpLeaks(const char* path = nullptr) noexcept;

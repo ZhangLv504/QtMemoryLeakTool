@@ -82,7 +82,7 @@ CMake 改造（替换现有"GLOB 单目标"结构）：
 | 组件 | 职责 | 约束 |
 |---|---|---|
 | `MemTrackerConfig.h` | 表容量、路径长度、atexit 开关、aligned 开关 | 纯宏，无 include 依赖 |
-| `MemTracker.h` | `memtrack::start/stop/setLogPath/stats/dumpLeaks`、`Stats` | 仅 `<cstddef>`；**不定义 `new` 宏**；全部 `noexcept` |
+| `MemTracker.h` | `memtrack::start/stop/setLogPath/setPhaseName/stats/dumpLeaks`、`Stats` | 仅 `<cstddef>`；**不定义 `new` 宏**；全部 `noexcept` |
 | `MemTracker.cpp` | 全局 new/delete 重载、静态表读写、日志落盘、atexit 注册 | 不 include `MemHook.h`；只用 CRT/OS API，不用 STL 容器 |
 | `MemHook.h` | `#define new new(__FILE__, __LINE__)` | 先 `#include <new>`；提供 `MEMTRACK_DISABLE_NEW_MACRO` 关闭开关 |
 | `demo/phase1/main.cpp` | 验证入口，`MemHook.h` 放在所有 include 之后 | 自校验 `Stats`，失败返回非 0 |
@@ -115,7 +115,7 @@ struct BlockInfo {              // POD，x64 下 48 字节
 - **防递归**：`thread_local` 重入深度计数，`depth > 0` 时直接透传（正常分配/释放但不记录）。表为静态 POD、后备分配用 `malloc`，正常情况下不会递归；该守卫用于异常机制、CRT 内部等病态路径。
 - **防死锁**：临界区不嵌套、不在持锁时做 IO；`dumpLeaks` 逐槽"加锁复制一条 → 解锁格式化写出"，全程不长时间持锁，也不使用第二把锁。
 - **初始化顺序**：跟踪器状态全为静态 POD/原子量，无构造函数，避免静态初始化期分配与顺序问题。
-- **落盘路径零分配**：只用 `snprintf` + `std::fopen/fprintf/fclose`（CRT 走 `malloc`，不经过 `operator new`）。
+- **落盘路径零分配**：路径拼接与目录创建只用静态缓冲 + `snprintf` + `_mkdir`/`mkdir` + `std::fopen/fprintf/fclose`（CRT 走 `malloc`，不经过 `operator new`）；目录创建只在 `start()` 配置阶段发生，不在分配钩子内。
 
 ### 6. 全局钩子与宏契约
 
@@ -193,9 +193,10 @@ struct Stats {
     bool          enabled;
 };
 
-bool  start(const char* logPath = nullptr) noexcept;  // 默认 memtrack_leaks.log
+bool  start(const char* logPath = nullptr) noexcept;  // 空则启用自动日志布局
 void  stop() noexcept;                                // 仅暂停记录，不丢记录、不落盘
-bool  setLogPath(const char* path) noexcept;          // 复制进静态 char[512]
+bool  setLogPath(const char* path) noexcept;          // 显式路径，优先于自动布局
+bool  setPhaseName(const char* phase) noexcept;       // 自动布局的阶段目录名
 Stats stats() noexcept;                               // 原子快照
 int   dumpLeaks(const char* path = nullptr) noexcept; // 返回泄漏块数；失败返回 -1
 }
@@ -203,11 +204,12 @@ int   dumpLeaks(const char* path = nullptr) noexcept; // 返回泄漏块数；�
 
 | API | 语义 | 说明 |
 |---|---|---|
-| `start` | 开启记录并注册 atexit 自动落盘 | 幂等；`logPath` 为空用默认路径；路径超长返回 `false` 且不开启 |
+| `start` | 开启记录并注册 atexit 自动落盘 | 幂等；`logPath` 为空时按 8.1 自动创建运行目录，目录创建失败返回 `false` 且不开启 |
 | `stop` | 暂停记录，保留已有记录，**取消**自动落盘 | 期间分配/释放走透传，不记录；之后可再次 `start` 重新开启 |
-| `setLogPath` | 设置默认落盘路径 | 任意时刻可调用；超过 `MEMTRACK_PATH_MAX` 返回 `false` |
+| `setLogPath` | 设置显式日志路径 | 设置后进入显式路径模式，自动布局不再生效；超过 `MEMTRACK_PATH_MAX` 返回 `false` |
+| `setPhaseName` | 设置自动布局的阶段目录名 | 仅首次自动 `start` 之前有效；非空、单段、不含 `/` `\` `:`、不是 `.`/`..`；目录已初始化后返回 `false` |
 | `stats` | 读取计数快照 | 不持锁导出，不加锁读原子计数 |
-| `dumpLeaks` | 写快照日志，**不清空**记录 | 同路径重复写会覆盖（`wb`）；不改变跟踪状态 |
+| `dumpLeaks` | 写快照日志，**不清空**记录 | 默认写入本次运行目录并自动编号（`manual-N.log`）；显式路径仍覆盖写（`wb`）；不改变跟踪状态 |
 
 所有 API `noexcept`、无动态分配，可在 `start` 之前或 `stop` 之后调用。
 
@@ -234,7 +236,31 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 3. 每条块一行，`block` 开头；键顺序固定为 `seq addr size tid align line file`，`file` 是行尾原始值（允许空格），未知时为 `<unknown>`。
 4. 地址格式固定 `0x%016llX`。
 5. 行序不保证按 `seq` 排序（解析方按 `seq` 自行排序）；`seq` 全局单调递增。
-6. 后续阶段只允许在头部块内追加新 `key=value`，或在该行末尾追加新键；不得重命名/删除/调整已有键，不得修改首末行与文件名约定。
+6. 后续阶段只允许在头部块内追加新 `key=value`，或在该行末尾追加新键；不得重命名/删除/调整已有键，不得修改首末行；文件位置与命名只能按 8.1 新增，不得改义。
+
+### 8.1 日志存储布局（v2）
+
+> 目录与命名规则自阶段一起生效；日志内容格式仍是上面的 v1。
+
+```
+logs/
+  phase1/
+    20261103-221530_pid20788/
+      run.log        ← atexit 自动落盘（dump_reason=atexit）
+      manual-1.log   ← 第 1 次 dumpLeaks()（dump_reason=manual）
+      manual-2.log   ← 第 2 次 dumpLeaks()
+  phase2/
+    20261103-223001_pid31044/
+      run.log
+```
+
+1. 根目录为 `MEMTRACK_LOG_ROOT`（默认 `logs`），相对进程当前工作目录；由 `start()` 自动创建，创建失败时 `start()` 返回 `false` 且不开启记录。
+2. 第二级为阶段目录，由 `setPhaseName()` 指定，默认 `default`；阶段一入口设为 `phase1`，阶段二设为 `phase2`。
+3. 第三级为一次进程运行的目录：`<yyyyMMdd-HHmmss>_pid<pid>`，时间取首次自动 `start()` 的时刻；`stop()` 后再次 `start()` 复用同一目录，一次运行的所有日志集中存放。
+4. 自动落盘写 `run.log`；手动 `dumpLeaks()` 依次写 `manual-1.log`、`manual-2.log`…，同一次运行内不互相覆盖。
+5. 显式路径优先：`setLogPath()` 或 `start(path)` 一旦设置，默认落盘全部写到该路径，不创建自动目录（兼容阶段一早期行为）。
+6. 未调用过 `start()` 且无显式路径时，`dumpLeaks()` 回退到旧默认 `memtrack_leaks.log`（相对当前工作目录）。
+7. 自动布局只改变文件位置与命名，日志内容仍是 v1；解析方按阶段目录区分阶段，按运行目录时间戳/`generated_at` 区分运行。
 
 ### 9. 关键流程（实现必须逐分支覆盖）
 
@@ -251,6 +277,8 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 | `MEMTRACK_PATH_MAX` | 512 | 日志路径静态缓冲长度 |
 | `MEMTRACK_ENABLE_ATEXIT` | 1 | 是否支持自动落盘 |
 | `MEMTRACK_ENABLE_ALIGNED` | 1 | 是否编译 aligned 重载族 |
+| `MEMTRACK_LOG_ROOT` | `"logs"` | 自动日志根目录，相对当前工作目录 |
+| `MEMTRACK_PHASE_MAX` | 64 | 阶段目录名静态缓冲长度（含结尾 `\0`） |
 
 ### 11. 阶段一验收场景（`Phase1Demo` 内自校验）
 
@@ -261,8 +289,9 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 | 2 个工作线程各泄漏 1 块（`int[4]`、`long long[2]`） | 2 条记录，各 16 字节，`tid` 不同 |
 | 无宏 TU（`plain_new.cpp`）泄漏 `new uint64_t[4]` | 1 条记录，32 字节，`file=<unknown> line=0` |
 | `stop()` 后在无宏 TU 分配、`start()` 后释放 | `unknownFrees == 1` |
-| 手动 `dumpLeaks("memtrack_manual.log")` | 文件存在，5 条块，头部 `dump_reason=manual` |
-| 程序正常退出 | `memtrack_leaks.log` 存在，`dump_reason=atexit`，`live_blocks=5`、`live_bytes=128`、`table_overflows=0` |
+| 手动 `dumpLeaks()` | `logs/phase1/<yyyyMMdd-HHmmss>_pid<pid>/manual-1.log` 存在，5 条块，头部 `dump_reason=manual` |
+| 程序正常退出 | 同一运行目录下 `run.log` 存在，`dump_reason=atexit`，`live_blocks=5`、`live_bytes=128`、`table_overflows=0` |
+| 目录布局 | `logs/phase1/<运行目录>/` 三级结构成立，阶段目录名来自 `setPhaseName("phase1")` |
 | 退出码 | `Stats` 与预期值全部一致返回 0，否则返回非 0 |
 
 ### 12. 已知限制与阶段二入口
@@ -274,6 +303,8 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 - 重复释放的第二次会记为 `unknownFrees`，不能可靠识别双重释放。
 - `start` 之前、`stop` 期间的块不受跟踪；`atexit` 早于早于 `main` 构造的静态对象析构（其析构中释放的块仍会出现在报告里，属预期内偏差）。
 - Windows 下路径经 `fopen` 按当前 ANSI 代码页处理，非 ASCII 路径可能打不开。
+- 自动日志布局相对当前工作目录：从不同目录启动会在各自 CWD 下生成 `logs/`；CWD 不可写时 `start()` 返回 `false`。
+- 显式路径模式不参与自动编号，多次 `dumpLeaks()` 会覆盖同一文件。
 - 跨 DLL 不生效（各模块 CRT 独立）。
 
 **阶段二入口**
@@ -290,6 +321,7 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 - 构建改造：静态库 `memtrack_core`（关闭 AUTOMOC/AUTOUIC/AUTORCC，不依赖 Qt）+ 可执行 `Phase1Demo`；移除练习用 `src/main.cpp`。
 - 全局钩子按契约覆盖：普通/数组/sized/nothrow/宏 placement/C++17 aligned 的分配与释放。
 - 日志 v1 落盘：manual 与 atexit 两条路径均验证。
+- 日志自动布局（8.1）：`setPhaseName("phase1")` 后由 `start()` 创建 `logs/phase1/<yyyyMMdd-HHmmss>_pid<pid>/`，手动写 `manual-N.log`、退出写 `run.log`；显式路径模式保持优先。
 - 按契约第 6 条补齐全部交付文件的中文注释：文件头、函数职责与约束、静态表/哈希设计、线程安全与防递归策略、宏边界、资源释放责任、验证场景与预期日志。
 
 ### 实现要点（与架构契约一致）
@@ -298,13 +330,15 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 - 单把 `std::atomic_flag` 自旋锁保护整表；`thread_local` 重入深度守卫；`dump` 逐槽“加锁复制→解锁写盘”，不长时间持锁。
 - 分配失败抛 `std::bad_alloc`，nothrow 形式返回 `nullptr`；未命中表的释放计入 `unknownFrees`，按记录中的 `align` 或调用形式选择 `free` / `_aligned_free`。
 - `stop()` 仅暂停记录并取消自动落盘，释放仍会清理既有记录；`start()` 可重新开启。
+- 自动日志目录在 `start()` 配置阶段用静态缓冲 + `snprintf` + `_mkdir` 创建，不进入分配钩子；路径状态由 `g_lock` 保护，目录创建与路径格式化均在锁外，不违反“临界区无 IO/无分配”。
 - 契约补充（已同步到第 6 节）：`MemHook.h` 必须声明四个 placement 分配/释放重载，否则 MSVC 在调用点重载解析失败（构建首轮即暴露，已修正）。
 
 ### 验证结果
 
 - 构建：`cmake -S . -B build -G "Visual Studio 17 2022" -A x64` + `cmake --build build --config RelWithDebInfo`，成功生成 `Phase1Demo.exe`。
 - 运行：`live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`，输出 `PASS`，退出码 0。
-- `memtrack_manual.log` 与 `memtrack_leaks.log`：`dump_reason` 分别为 `manual` / `atexit`，各 5 条块记录；两个工作线程 `tid` 不同；无宏 TU 的块为 `file=<unknown> line=0`。
+- `logs/phase1/<yyyyMMdd-HHmmss>_pid<pid>/manual-1.log` 与同目录 `run.log`：`dump_reason` 分别为 `manual` / `atexit`，各 5 条块记录；两个工作线程 `tid` 不同；无宏 TU 的块为 `file=<unknown> line=0`。
+- 连续两次运行生成两个独立的时间戳运行目录，`manual-N.log` 编号与 `run.log` 命名符合 8.1。
 - 1000 次 `new/delete` 循环未产生误报；墓碑槽被复用。
 
 ### 已知限制
@@ -313,5 +347,5 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 
 ### 下一阶段入口
 
-- 新增 `Phase2App`（Qt5 Widgets）并链接 `memtrack_core`，不改动钩子与日志 v1 格式，只在头部追加键。
+- 新增 `Phase2App`（Qt5 Widgets）并链接 `memtrack_core`，不改动钩子与日志 v1 格式，只在头部追加键；入口调用 `setPhaseName("phase2")`，日志落到 `logs/phase2/...`。
 - Qt 初始化会产生大量非目标分配，建议 UI 构建完成后再 `start()`，并按分配峰值调整 `MEMTRACK_TABLE_CAPACITY`。

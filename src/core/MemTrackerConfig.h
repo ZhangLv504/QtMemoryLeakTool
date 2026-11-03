@@ -33,11 +33,26 @@
 #define MEMTRACK_ENABLE_ALIGNED 1
 #endif
 
+// 自动日志根目录，相对进程当前工作目录。start() 为空路径时会创建
+// <root>/<phase>/<运行时间戳>_pid<pid>/ 三级目录；显式 setLogPath/start(path)
+// 不参与该布局，因此不受此宏影响。
+#ifndef MEMTRACK_LOG_ROOT
+#define MEMTRACK_LOG_ROOT "logs"
+#endif
+
+// 阶段目录名（如 phase1/phase2）的静态缓冲长度，含结尾 '\0'。
+// 阶段名由 setPhaseName() 在首次自动 start 之前指定。
+#ifndef MEMTRACK_PHASE_MAX
+#define MEMTRACK_PHASE_MAX 64u
+#endif
+
 // 编译期守住契约：容量为 2 的幂是索引算法前提；路径缓冲至少容纳默认文件名
-// 加常见目录前缀，避免默认配置下就不可用。
+// 加常见目录前缀，避免默认配置下就不可用；阶段名至少要能放下 "phase1"。
 static_assert(MEMTRACK_TABLE_CAPACITY >= 2u,
               "MEMTRACK_TABLE_CAPACITY must be at least 2");
 static_assert((MEMTRACK_TABLE_CAPACITY & (MEMTRACK_TABLE_CAPACITY - 1u)) == 0u,
               "MEMTRACK_TABLE_CAPACITY must be a power of two");
 static_assert(MEMTRACK_PATH_MAX >= 16u,
               "MEMTRACK_PATH_MAX must be at least 16");
+static_assert(MEMTRACK_PHASE_MAX >= 8u,
+              "MEMTRACK_PHASE_MAX must be at least 8");
