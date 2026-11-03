@@ -1,6 +1,6 @@
 # 项目进度与架构契约
 
-> 状态：阶段一架构设计已冻结，代码待实现。阶段二未启动。
+> 状态：阶段一已完成并通过 `Phase1Demo` 自校验；阶段二未启动。
 
 ## 核心需求与阶段划分
 
@@ -30,10 +30,20 @@
 3. **每阶段可运行**：每个阶段必须交付一个能独立编译、链接并运行的 `main` 入口（或独立可执行目标），确保用户先看到该阶段的部分功能，再进入下一阶段。
 4. **架构先行**：每阶段开写前，先在本文件补充该阶段的架构设计与接口契约，代码实现必须与契约一致。
 5. **无损增量**：后续阶段的代码不得破坏前一阶段已通过验证的功能与日志格式。
+6. **代码注释规范**：所有交付的 C++ 头文件、源文件、构建脚本及验证用 `main.cpp` 必须包含充分注释。至少包括：
+    - 文件头注释：文件用途、所属阶段、项目名称；
+    - 类与函数注释：职责、参数含义、返回值、调用约束；
+    - 关键数据结构与算法说明：哈希表/静态池的设计意图、生命周期；
+    - 线程安全说明：锁的粒度、加锁顺序、防死锁策略；
+    - 防递归说明：哪些内部路径禁止再次触发全局 `new/delete`；
+    - 宏替换说明：`#define new new(__FILE__, __LINE__)` 的边界与使用限制；
+    - 资源释放责任：谁分配、谁释放、何时释放；
+    - 验证用例注释：每个泄漏场景的制造意图与预期日志结果。
+    禁止无注释堆砌代码，也禁止仅机械重复代码语义的无效注释；注释统一使用中文，与项目文档保持一致。
 
 ## 阶段一架构设计与接口契约
 
-> 状态：设计冻结，待实现。实现必须与下表一致；如需偏离，先改本节再写代码。
+> 状态：已实现并通过 `Phase1Demo` 验证（见文末完成记录）。实现与本节契约一致；偏离点已回写第 6 节。
 
 ### 1. 范围与非目标
 
@@ -150,7 +160,13 @@ void  operator delete(void*, const char*, int, std::align_val_t) noexcept;  // �
 ```cpp
 // MemHook.h
 #pragma once
+#include <cstddef>
 #include <new>
+// 宏展开后的 placement 重载必须在调用点可见，否则重载解析失败
+void* operator new(std::size_t size, const char* file, int line);
+void* operator new[](std::size_t size, const char* file, int line);
+void operator delete(void* p, const char* file, int line) noexcept;
+void operator delete[](void* p, const char* file, int line) noexcept;
 #if !defined(MEMTRACK_DISABLE_NEW_MACRO)
 #  define new new(__FILE__, __LINE__)
 #endif
@@ -264,3 +280,38 @@ block seq=2 addr=0x000001F2A3B4C5E0 size=24 tid=14532 align=0 line=58 file=D:/Ai
 - 新增 `Phase2App`（Qt5 Widgets）链接 `memtrack_core`，不改动钩子与日志格式，仅在头部追加键。
 - Qt 自身大量走 `operator new`，进场前需评估 `MEMTRACK_TABLE_CAPACITY`；可在 UI 初始化完成后 `start()`，避免无关噪声。
 - 对象树面板只读 `QObject::children()`，不参与内存跟踪数据结构。
+
+## 阶段一完成记录（2026-11-03）
+
+### 已完成事项
+
+- 新增核心源码：`src/core/MemTrackerConfig.h`、`MemTracker.h`、`MemTracker.cpp`、`MemHook.h`。
+- 新增阶段一验证入口：`demo/phase1/main.cpp`、`demo/phase1/plain_new.cpp`。
+- 构建改造：静态库 `memtrack_core`（关闭 AUTOMOC/AUTOUIC/AUTORCC，不依赖 Qt）+ 可执行 `Phase1Demo`；移除练习用 `src/main.cpp`。
+- 全局钩子按契约覆盖：普通/数组/sized/nothrow/宏 placement/C++17 aligned 的分配与释放。
+- 日志 v1 落盘：manual 与 atexit 两条路径均验证。
+- 按契约第 6 条补齐全部交付文件的中文注释：文件头、函数职责与约束、静态表/哈希设计、线程安全与防递归策略、宏边界、资源释放责任、验证场景与预期日志。
+
+### 实现要点（与架构契约一致）
+
+- 静态表 `BlockInfo[MEMTRACK_TABLE_CAPACITY]`（默认 16384，开放寻址 + 墓碑复用），`splitmix64` 哈希；跟踪器内部零堆分配，只用 CRT/OS API。
+- 单把 `std::atomic_flag` 自旋锁保护整表；`thread_local` 重入深度守卫；`dump` 逐槽“加锁复制→解锁写盘”，不长时间持锁。
+- 分配失败抛 `std::bad_alloc`，nothrow 形式返回 `nullptr`；未命中表的释放计入 `unknownFrees`，按记录中的 `align` 或调用形式选择 `free` / `_aligned_free`。
+- `stop()` 仅暂停记录并取消自动落盘，释放仍会清理既有记录；`start()` 可重新开启。
+- 契约补充（已同步到第 6 节）：`MemHook.h` 必须声明四个 placement 分配/释放重载，否则 MSVC 在调用点重载解析失败（构建首轮即暴露，已修正）。
+
+### 验证结果
+
+- 构建：`cmake -S . -B build -G "Visual Studio 17 2022" -A x64` + `cmake --build build --config RelWithDebInfo`，成功生成 `Phase1Demo.exe`。
+- 运行：`live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`，输出 `PASS`，退出码 0。
+- `memtrack_manual.log` 与 `memtrack_leaks.log`：`dump_reason` 分别为 `manual` / `atexit`，各 5 条块记录；两个工作线程 `tid` 不同；无宏 TU 的块为 `file=<unknown> line=0`。
+- 1000 次 `new/delete` 循环未产生误报；墓碑槽被复用。
+
+### 已知限制
+
+沿用第 12 节列表，阶段一未新增限制。
+
+### 下一阶段入口
+
+- 新增 `Phase2App`（Qt5 Widgets）并链接 `memtrack_core`，不改动钩子与日志 v1 格式，只在头部追加键。
+- Qt 初始化会产生大量非目标分配，建议 UI 构建完成后再 `start()`，并按分配峰值调整 `MEMTRACK_TABLE_CAPACITY`。
