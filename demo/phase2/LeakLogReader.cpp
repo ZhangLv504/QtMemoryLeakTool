@@ -1,9 +1,8 @@
-// =============================================================================
-// 文件：demo/phase2/LeakLogReader.cpp
-// 项目：QtMemoryLeakTool / QtMemTracker
-// 阶段：阶段二扩展 —— 泄漏日志查看
-// 用途：实现日志发现与 v1 解析。解析是只读的，不触碰跟踪器状态。
-// =============================================================================
+/**
+ * @file LeakLogReader.cpp
+ * @brief 日志发现与 v1 解析的实现。
+ * @details 阶段二扩展：泄漏日志查看。解析是只读的，不触碰跟踪器状态。
+ */
 #include "LeakLogReader.h"
 
 #include <QDateTime>
@@ -19,7 +18,11 @@
 
 namespace {
 
-// 统一设置错误文本；error 允许为空。
+/**
+ * @brief 统一设置错误文本。
+ * @param[out] error 错误输出；允许为 nullptr。
+ * @param[in] message 错误信息。
+ */
 void setError(QString* error, const QString& message)
 {
     if (error != nullptr)
@@ -39,7 +42,7 @@ QStringList leaklog::listLogFiles(const QString& rootDir)
         return QStringList();
     }
 
-    // 递归覆盖 <root>/<phase>/<run>/*.log；调用方传入 phase 层或 logs 层都可。
+    //! 递归覆盖 <root>/<phase>/<run>/*.log；调用方传入 phase 层或 logs 层都可。
     QDirIterator iterator(root.absolutePath(), QStringList() << QStringLiteral("*.log"),
                           QDir::Files, QDirIterator::Subdirectories);
     while (iterator.hasNext())
@@ -48,7 +51,7 @@ QStringList leaklog::listLogFiles(const QString& rootDir)
         files.append(iterator.fileInfo());
     }
 
-    // 最近修改的日志排在前面，界面默认加载第一项。
+    //! 最近修改的日志排在前面，界面默认加载第一项。
     std::sort(files.begin(), files.end(),
               [](const QFileInfo& left, const QFileInfo& right)
               {
@@ -87,7 +90,7 @@ bool leaklog::readLog(const QString& path, LeakLogData& out, QString* error)
     stream.setCodec("UTF-8");
     const QStringList lines = stream.readAll().split(QLatin1Char('\n'));
 
-    // v1 block 行固定键序，file 作为行尾原始值（允许空格）。
+    //! v1 block 行固定键序，file 作为行尾原始值（允许空格）。
     static const QRegularExpression blockPattern(QStringLiteral(
         "^block seq=(\\d+) addr=(0x[0-9A-Fa-f]+) size=(\\d+) "
         "tid=(\\d+) align=(\\d+) line=(-?\\d+) file=(.*)$"));
@@ -143,7 +146,7 @@ bool leaklog::readLog(const QString& path, LeakLogData& out, QString* error)
         {
             out.header.insert(line.left(equals), line.mid(equals + 1));
         }
-        // 其余无法识别的行忽略，保持对后续 v1 追加键的兼容。
+        //! 其余无法识别的行忽略，保持对后续 v1 追加键的兼容。
     }
 
     if (!headerSeen)

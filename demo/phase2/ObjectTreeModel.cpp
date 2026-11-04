@@ -1,12 +1,11 @@
-// =============================================================================
-// 文件：demo/phase2/ObjectTreeModel.cpp
-// 项目：QtMemoryLeakTool / QtMemTracker
-// 阶段：阶段二 —— Qt 对象树监控界面
-// 用途：只读对象树模型的实现。refresh() 在 GUI 线程递归读取 QObject::children()
-//       并构建值语义快照；视图通过标准 QAbstractItemModel 接口访问快照。
-// 线程安全：无锁；所有方法必须在 GUI 线程调用（与 QWidget/QTreeView 一致）。
-// 资源释放：模型不拥有 QObject，也不持有裸指针所有权；快照随模型析构释放。
-// =============================================================================
+/**
+ * @file ObjectTreeModel.cpp
+ * @brief 只读对象树模型的实现。
+ * @details refresh() 在 GUI 线程递归读取 QObject::children() 并构建值语义快照；
+ *          视图通过标准 QAbstractItemModel 接口访问快照。
+ * @note 线程安全：无锁；所有方法必须在 GUI 线程调用（与 QWidget/QTreeView 一致）。
+ * @note 资源释放：模型不拥有 QObject，也不持有裸指针所有权；快照随模型析构释放。
+ */
 #include "ObjectTreeModel.h"
 
 #include <QColor>
@@ -16,7 +15,7 @@
 
 namespace {
 
-// 列的展示名，顺序与 data() 的分支一致。
+/// 列的展示名，顺序与 data() 的分支一致。
 const char* const kColumnTitles[] = {"对象", "类型", "子对象数", "地址"};
 
 } // namespace
@@ -30,7 +29,7 @@ ObjectTreeModel::~ObjectTreeModel() = default;
 
 void ObjectTreeModel::setRootObject(QObject* root)
 {
-    // 只保存 QPointer：目标对象销毁后 hasRoot() 自动为 false。
+    //! 只保存 QPointer：目标对象销毁后 hasRoot() 自动为 false。
     m_root = root;
     m_hasRoot = (root != nullptr);
     refresh();
@@ -48,7 +47,7 @@ void ObjectTreeModel::setSearchText(const QString& text)
         return;
     }
     m_searchText = text;
-    // 只刷新背景角色，不重建快照，展开状态与选中项保持不变。
+    //! 只刷新背景角色，不重建快照，展开状态与选中项保持不变。
     notifyBackgroundChanged();
 }
 
@@ -59,7 +58,7 @@ QString ObjectTreeModel::searchText() const
 
 void ObjectTreeModel::refresh()
 {
-    // 重置期间视图不持有旧索引；重建完成后一次性通知新快照。
+    //! 重置期间视图不持有旧索引；重建完成后一次性通知新快照。
     beginResetModel();
     if (hasRoot())
     {
@@ -69,7 +68,7 @@ void ObjectTreeModel::refresh()
     {
         m_rootNode = ObjectNode();
     }
-    // 容器已不再变化，此时回填父指针与行号，地址保持稳定。
+    //! 容器已不再变化，此时回填父指针与行号，地址保持稳定。
     fixParents(m_rootNode);
     endResetModel();
 }
@@ -84,7 +83,7 @@ QModelIndex ObjectTreeModel::index(int row, int column,
 
     if (!parent.isValid())
     {
-        // 目标对象是唯一顶层行；未设置目标时模型为空。
+        //! 目标对象是唯一顶层行；未设置目标时模型为空。
         return hasRoot()
             ? createIndex(row, column, const_cast<ObjectNode*>(&m_rootNode))
             : QModelIndex();
@@ -97,7 +96,7 @@ QModelIndex ObjectTreeModel::index(int row, int column,
         return QModelIndex();
     }
 
-    // internalPointer 指向快照中的节点；refresh() 后容器才可能变化。
+    //! internalPointer 指向快照中的节点；refresh() 后容器才可能变化。
     return createIndex(row, column,
                        const_cast<ObjectNode*>(&parentNode->children.at(row)));
 }
@@ -138,7 +137,7 @@ int ObjectTreeModel::rowCount(const QModelIndex& parent) const
 
 int ObjectTreeModel::columnCount(const QModelIndex& parent) const
 {
-    // 树是统一列结构，子索引的列数同样为 4。
+    //! 树是统一列结构，子索引的列数同样为 4。
     return parent.column() > 0 ? 0 : kColumnCount;
 }
 
@@ -155,8 +154,8 @@ QVariant ObjectTreeModel::data(const QModelIndex& index, int role) const
         return QVariant();
     }
 
-    // 搜索命中时整行（4 列）使用淡蓝色背景；未命中不返回背景，
-    // 由视图继续使用默认交替行颜色。
+    //! 搜索命中时整行（4 列）使用淡蓝色背景；未命中不返回背景，
+    //! 由视图继续使用默认交替行颜色。
     if (role == Qt::BackgroundRole)
     {
         if (matchesSearch(*node))
@@ -197,7 +196,7 @@ QVariant ObjectTreeModel::headerData(int section, Qt::Orientation orientation,
     {
         return QVariant();
     }
-    // 列名固定且为 UTF-8 中文，使用 QString::fromUtf8 避免本地代码页影响。
+    //! 列名固定且为 UTF-8 中文，使用 QString::fromUtf8 避免本地代码页影响。
     return QString::fromUtf8(kColumnTitles[section]);
 }
 
@@ -207,7 +206,7 @@ Qt::ItemFlags ObjectTreeModel::flags(const QModelIndex& index) const
     {
         return Qt::NoItemFlags;
     }
-    // 只读：不提供 ItemIsEditable，也不实现 setData。
+    //! 只读：不提供 ItemIsEditable，也不实现 setData。
     return Qt::ItemIsEnabled | Qt::ItemIsSelectable;
 }
 
@@ -220,7 +219,7 @@ ObjectNode ObjectTreeModel::buildNode(QObject* object, int row) const
     node.address = addressText(object);
     node.row = row;
 
-    // 先复制 children 列表再递归：构建期间不修改被测对象。
+    //! 先复制 children 列表再递归：构建期间不修改被测对象。
     const QObjectList children = object->children();
     node.childCount = children.size();
     node.children.reserve(children.size());
@@ -249,14 +248,14 @@ QString ObjectTreeModel::displayName(const QObject* object)
 
 QString ObjectTreeModel::addressText(const QObject* object)
 {
-    // 固定 16 位十六进制，与阶段一日志的地址格式保持一致。
+    //! 固定 16 位十六进制，与阶段一日志的地址格式保持一致。
     return QStringLiteral("0x%1").arg(
         reinterpret_cast<quintptr>(object), 16, 16, QLatin1Char('0'));
 }
 
 bool ObjectTreeModel::matchesSearch(const ObjectNode& node) const
 {
-    // 子串匹配且不区分大小写；空搜索文本视为不匹配任何节点。
+    //! 子串匹配且不区分大小写；空搜索文本视为不匹配任何节点。
     return !m_searchText.isEmpty()
         && node.objectName.contains(m_searchText, Qt::CaseInsensitive);
 }
