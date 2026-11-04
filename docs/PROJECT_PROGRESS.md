@@ -1,6 +1,6 @@
 # 项目进度与架构契约
 
-> 状态：阶段一已完成并通过 `Phase1Demo` 自校验；阶段二未启动。
+> 状态：阶段一、阶段二均已完成并通过各自 demo 自校验；当前无未启动阶段。
 
 ## 核心需求与阶段划分
 
@@ -353,3 +353,219 @@ logs/
 
 - 新增 `Phase2App`（Qt5 Widgets）并链接 `memtrack_core`，不改动钩子与日志 v1 格式，只在头部追加键；入口调用 `setPhaseName("phase2")`，日志落到 `logs/phase2/...`。
 - Qt 初始化会产生大量非目标分配，建议 UI 构建完成后再 `start()`，并按分配峰值调整 `MEMTRACK_TABLE_CAPACITY`。
+
+## 阶段二架构设计与接口契约
+
+> 状态：架构已冻结，按本节实现；实现完成后在下文追加完成记录。阶段一已通过验证，本阶段不得破坏其钩子、日志格式与 `Phase1Demo`。
+
+### 1. 范围与非目标
+
+**范围内**
+- 新增 Qt5 Widgets 可执行目标 `Phase2App`：`QTreeView` + 自定义 `QAbstractItemModel`，快照式显示目标 `QObject` 及其递归子对象。
+- 提供一个测试窗口，内含带父子关系的 `QPushButton` / `QLabel` / `QWidget`，用于验证对象树拓扑。
+- 链接 `memtrack_core`：阶段名设为 `phase2`，UI 构建完成后才开始记录，退出时自动落盘。
+- 提供 `--self-check` 无界面自校验模式（offscreen 平台），供构建后验证对象树模型与日志集成。
+
+**非目标（阶段二不做）**
+- 实时增量刷新、对象编辑/删除、QML、跨线程对象树采集。
+- 修改阶段一全局钩子、静态表或日志 v1 格式。
+- 跟踪 Qt DLL 内部通过各自 CRT 完成的分配。
+- 展示非 `QObject` 的内存泄漏明细（该部分仍由阶段一 `.log` 承担）。
+
+### 2. 目录与构建目标结构
+
+```
+demo/phase2/CMakeLists.txt    Phase2App 目标声明
+demo/phase2/main.cpp          应用入口、测试窗口搭建、自校验
+demo/phase2/ObjectTreeModel.h 只读对象树模型声明（Q_OBJECT）
+demo/phase2/ObjectTreeModel.cpp 快照构建与 QAbstractItemModel 实现
+```
+
+- 根 `CMakeLists.txt` 仅追加一行 `add_subdirectory(demo/phase2)`，Qt5 查找沿用根文件的 `find_package`。
+- `demo/phase2/CMakeLists.txt` 自行声明目标、源文件、`Qt5::Widgets` 与 `memtrack_core` 依赖；仅对本目标开启 `AUTOMOC`（`AUTOUIC`/`AUTORCC` 关闭），不波及核心库与阶段一 demo。
+- MSVC 下加 `/FC`，保持与阶段一一致的绝对路径语义。
+- `Phase2App` 为控制台子系统可执行文件（便于自校验输出与退出码采集），运行时同时显示主窗口。
+
+### 3. 组件职责
+
+| 组件 | 职责 | 约束 |
+|---|---|---|
+| `ObjectTreeModel` | 持有某一时刻的对象树快照，按 4 列只读展示；`refresh()` 重建快照 | 只在 GUI 线程使用；不持有对象所有权；不修改对象树 |
+| `main.cpp` | 创建 `QApplication`、测试窗口、模型与视图；处理 `--self-check`；集成 `memtrack` | 不包含 `MemHook.h`；UI 构建完成后再 `start()` |
+| `Phase2App` | 阶段二可独立运行入口 | 启动默认显示窗口；`--self-check` 校验后自动退出 |
+
+### 4. 数据结构
+
+```cpp
+struct ObjectNode {                 // 快照节点，值语义，仅 GUI 线程访问
+    QPointer<QObject> object;       // 对应对象；对象已销毁时为空，仅用于诊断
+    QString className;              // QObject::metaObject()->className() 快照
+    QString objectName;             // QObject::objectName() 快照，空串显示 <unnamed>
+    QString address;                // 对象地址，格式 0x%016llX
+    int childCount;                 // children().size() 快照
+    int row;                        // 在父节点 children 中的行号
+    ObjectNode* parent;             // 父节点指针；根节点为 nullptr
+    QVector<ObjectNode> children;   // 递归子节点
+};
+```
+
+- 模型根节点 `m_rootNode` 即目标对象（如主窗口），作为唯一顶层行；`row = 0`，`parent = nullptr`。
+- 快照构建完成后不再修改容器，`QModelIndex::internalPointer` 指向稳定的节点地址。
+- 展示名称优先 `objectName`，为空时回退 `<unnamed>`；类型来自 `metaObject()`。
+- 列定义固定为：`对象`、`类型`、`子对象数`、`地址`。
+
+### 5. 线程模型
+
+- `QObject::children()` 与模型重构全部在 GUI 线程执行；模型不提供锁，不跨线程共享。
+- 刷新期间使用 `beginResetModel()` / `endResetModel()`，视图不持有跨快照的持久索引。
+- 快照只缓存字符串与 `QPointer`，刷新后即使原对象被销毁，`data()` 也不会解引用悬垂指针。
+
+### 6. 与阶段一跟踪器的集成
+
+- 入口在首次 `start()` 前调用 `memtrack::setPhaseName("phase2")`，并在 UI 全部构建完成后再 `memtrack::start()`，避免 Qt 初始化噪声占满静态表。
+- 日志自动落到 `logs/phase2/<yyyyMMdd-HHmmss>_pid<pid>/`，内容仍为 v1；本阶段不新增头部键。
+- 阶段二的所有翻译单元均不包含 `MemHook.h`（避免宏侵入 Qt 头文件）；Qt 代码中的裸 `new` 由全局钩子照常记录，位置为 `file=<unknown> line=0`。
+- `--self-check` 模式在退出前调用一次 `dumpLeaks()`，生成 `manual-1.log`；进程退出再由 atexit 写 `run.log`。
+
+### 7. `ObjectTreeModel` 接口契约
+
+```cpp
+class ObjectTreeModel : public QAbstractItemModel
+{
+    Q_OBJECT
+public:
+    explicit ObjectTreeModel(QObject* parent = nullptr);
+    void setRootObject(QObject* root);   // 设置目标对象并立即 refresh
+    QObject* rootObject() const;         // 返回 QPointer 提升后的指针，可能为 nullptr
+    void refresh();                      // 重建快照；根为空时模型为空
+    void setSearchText(const QString& text); // 按 objectName 子串高亮，空串清除
+    QString searchText() const;          // 当前搜索文本
+
+    // QAbstractItemModel 只读实现
+    QModelIndex index(int row, int column,
+                      const QModelIndex& parent = QModelIndex()) const override;
+    QModelIndex parent(const QModelIndex& child) const override;
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override;
+    int columnCount(const QModelIndex& parent = QModelIndex()) const override;
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override;
+    QVariant headerData(int section, Qt::Orientation orientation,
+                        int role = Qt::DisplayRole) const override;
+    Qt::ItemFlags flags(const QModelIndex& index) const override;
+};
+```
+
+- 只读：`flags()` 不返回 `Qt::ItemIsEditable`；未实现 `setData`。
+- `rowCount` 对有效父索引返回其 `children.size()`，对无效父索引返回 `1`（有根）或 `0`。
+- `data()` 响应 `Qt::DisplayRole` 与 `Qt::BackgroundRole`；搜索命中时 BackgroundRole 返回淡蓝色（`QColor(204,229,255)`），整行 4 列生效；列越界或索引无效返回空 `QVariant`。
+- `setSearchText()` 只递归发送 `BackgroundRole` 的 `dataChanged`，不重建快照，展开状态与选中项保持不变；匹配规则为 `objectName` 子串、不区分大小写。
+- `setRootObject(nullptr)` 清空模型；不接管对象生命周期。
+
+### 8. 测试窗口结构（对象名固定，供自校验）
+
+```
+mainWindow
+└─ centralWidget
+   └─ mainSplitter
+      ├─ objectTreeView          （QTreeView）
+      └─ testPanel
+         ├─ searchEdit             （QLineEdit，按对象名实时高亮）
+         ├─ testGroupBox
+         │  ├─ infoLabel
+         │  ├─ okButton
+         │  └─ nestedPanel
+         │     └─ nestedButton
+         ├─ refreshButton
+         └─ hintLabel
+```
+
+- `refreshButton` 点击后调用 `model.refresh()` 并 `view->expandAll()`。
+- 控件通过布局建立父子关系，布局同时负责可视排列。
+
+### 9. 启动流程与自校验
+
+- 普通启动：构建窗口 → `setPhaseName("phase2")` → `start()` → `show()` → `app.exec()`。
+- `--self-check`：若未设置 `QT_QPA_PLATFORM`，入口设置 `offscreen`；构建并显示窗口，在事件循环首轮用 `QTimer::singleShot(0, ...)` 执行校验：
+  1. 根节点显示名为 `mainWindow`；
+  2. 第 8 节全部对象名都出现在模型中；
+  3. `nestedButton` 位于 `nestedPanel` 的子树内；
+  4. 节点总数不少于 10；
+  5. 调用 `dumpLeaks()` 并打印统计与 `PASS`/`FAIL`，以 0/1 退出；
+  6. 校验对象树默认展开（根与嵌套节点均为展开状态）且水平/垂直滚动条策略为 `ScrollBarAlwaysOn`；
+  7. 校验搜索：输入 `nested` 时 `nestedPanel` 的 `BackgroundRole` 有效、根节点无效；清空后高亮消失。
+- 校验逻辑只通过 `QAbstractItemModel` 公共接口遍历模型，不访问模型私有成员。
+
+### 10. 阶段二验收场景
+
+| 场景 | 预期 |
+|---|---|
+| VS 2022 生成器构建 | 生成 `build/demo/phase2/RelWithDebInfo/Phase2App.exe` |
+| `--self-check`（offscreen） | 输出 `PASS`，退出码 0，节点数与对象名校验全部通过 |
+| 对象树根与拓扑 | 顶层为 `mainWindow`；`nestedButton` 的祖先链包含 `nestedPanel` |
+| 刷新 | 点击 `refreshButton` 后模型重置并重新展开 |
+| 默认展开与滚动条 | 启动后对象树全部展开；水平、垂直滚动条常驻 |
+| 列宽可调 | 四列均为 `QHeaderView::Interactive`，可拖动列边界改变宽度（初始 220/140/80/160） |
+| 搜索高亮 | 输入对象名子串后，命中行 4 列显示淡蓝背景；清空输入恢复默认底色 |
+| 手动落盘 | `logs/phase2/<运行目录>/manual-1.log`，`dump_reason=manual` |
+| 退出落盘 | 同一运行目录 `run.log`，`dump_reason=atexit` |
+| 无损增量 | `Phase1Demo` 仍可构建运行并输出 `PASS`；日志 v1 格式未变 |
+
+### 11. 已知限制
+
+- 快照式显示：对象树在构建后新增/删除的子对象需手动刷新，不做增量同步。
+- 仅展示 `QObject` 派生对象；普通堆分配仍只能通过阶段一 `.log` 排查。
+- Qt DLL 内部经各自 CRT 的分配不受钩子影响，表中数据只覆盖应用侧。
+- `--self-check` 使用 offscreen 平台，只验证模型拓扑与集成，不验证实际渲染效果。
+- UI 构建完成后再 `start()`，因此 Qt 初始化期的分配不在报告中。
+
+## 阶段二完成记录（2026-11-04）
+
+### 已完成事项
+
+- 新增阶段二目标源码：`demo/phase2/ObjectTreeModel.h`、`ObjectTreeModel.cpp`、`main.cpp`、`CMakeLists.txt`。
+- 根 `CMakeLists.txt` 追加 `add_subdirectory(demo/phase2)`，其余编排未改动。
+- 实现只读对象树模型：快照递归 `QObject::children()`，固定 4 列（对象/类型/子对象数/地址），使用 `QPointer` 与缓存字符串，刷新后不解引用悬垂指针。
+- 实现测试窗口：`QTreeView` + 固定对象名的两级父子控件（`testGroupBox → nestedPanel → nestedButton`），刷新按钮重建快照并展开。
+- 集成阶段一跟踪器：UI 构建完成后 `setPhaseName("phase2")` + `start()`；日志自动落到 `logs/phase2/<运行目录>/`，v1 格式未改动。
+- 提供 `--self-check`：offscreen 平台启动，事件循环首轮通过模型公共接口校验根节点、12 个必需对象名、嵌套拓扑与节点数，输出统计与 `PASS`/`FAIL`，退出码 0/1。
+
+### 实现要点（与架构契约一致）
+
+- `ObjectTreeModel::refresh()` 使用 `beginResetModel()`/`endResetModel()`；`buildNode()` 递归构建值语义快照，`fixParents()` 在容器停止增长后回填 `parent`/`row`，保证 `internalPointer` 稳定。
+- `rowCount`：无效父索引返回 1（有根）或 0，有效父索引返回快照子节点数；`flags()` 只返回 `ItemIsEnabled | ItemIsSelectable`，不实现 `setData`。
+- 模型不持有 `QObject` 所有权；目标对象销毁后 `hasRoot()` 为 false，模型为空。
+- 阶段二全部翻译单元不包含 `MemHook.h`；Qt 头文件不受 `new` 宏影响，应用侧裸分配仍由全局钩子记录为 `file=<unknown>`。
+- `AUTOMOC` 仅在 `Phase2App` 目标开启；`memtrack_core` 与 `Phase1Demo` 仍保持 Qt 元对象解耦。
+
+### 验证结果
+
+- 构建：`cmake -S . -B build -G "Visual Studio 17 2022" -A x64` + `cmake --build build --config RelWithDebInfo`，生成 `build/demo/phase2/RelWithDebInfo/Phase2App.exe`。
+- 自校验：`QT_QPA_PLATFORM=offscreen`（由程序在未设置时补齐）运行 `Phase2App.exe --self-check`，输出
+  `nodes=42 max_depth=7 live_blocks=1 live_bytes=32 unknown_frees=0 table_overflows=0 manual_rows=1`、`PASS`，退出码 0。
+- 日志：`logs/phase2/20261104-172725_pid31892/manual-1.log`（`dump_reason=manual`，1 条 32 字节块，`file=<unknown>`）与同目录 `run.log`（`dump_reason=atexit`，首末行与键序符合 v1）。
+- 回归：`Phase1Demo` 重新运行仍输出 `live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`、`PASS`，退出码 0。
+- 说明：`run.log` 中 `unknown_frees=17`、`live_blocks=0` 属预期——`start()` 之前 Qt 初始化分配的块在退出析构时被释放，表中无记录，计为未知释放。
+
+### 已知限制
+
+沿用阶段二架构契约第 11 节，未新增限制；补充验证口径：本次仅以 offscreen 自校验验证模型拓扑与日志集成，实际窗口渲染与鼠标交互未做人工目视验证。
+
+### 下一阶段入口
+
+两个既定阶段均已完成。后续若扩展，入口保持为：不改动阶段一钩子与日志 v1 格式；新增界面能力放在 `demo/phase2` 或新子目录，通过模型公共接口读取对象树；任何包含 Qt 头文件的翻译单元仍禁止包含 `MemHook.h`。
+
+## 阶段二界面补充记录（2026-11-04）
+
+### 变更事项
+
+- 默认展开：`view->expandAll()` 移到 `window.show()` 之后执行（QTreeView 需可见后完成完整布局），启动即全展开；刷新按钮仍会重建快照并重新展开。
+- 滚动条：对象树视图的水平、垂直滚动条策略均设为 `Qt::ScrollBarAlwaysOn`。
+- 列宽可调：四列尺寸模式统一为 `QHeaderView::Interactive`（初始宽度 220/140/80/160），用户可拖动列边界，不再被 `Stretch`/`ResizeToContents` 锁定。
+- 搜索：右侧面板新增 `searchEdit`（QLineEdit，实时触发）；模型新增 `setSearchText()` / `searchText()`，按 `objectName` 子串、不区分大小写匹配，命中行 4 列使用淡蓝色背景 `QColor(204,229,255)`，空文本清除高亮。
+- 搜索只递归发送 `Qt::BackgroundRole` 的 `dataChanged`，不重建快照，展开状态与选中项不丢失。
+- `--self-check` 扩展校验默认展开、双滚动条常驻、四列可拖动、搜索命中/清除。
+
+### 验证结果
+
+- `Phase2App.exe --self-check`（offscreen）：`nodes=46 max_depth=7 expand=ok scrollbars=ok columns=ok search=ok live_blocks=1 live_bytes=40 unknown_frees=0 table_overflows=0 manual_rows=1`、`PASS`，退出码 0。
+- 日志仍为 v1：`logs/phase2/<运行目录>/manual-1.log`（`dump_reason=manual`）与 `run.log`（`dump_reason=atexit`）。
+- 回归：`Phase1Demo` 输出 `live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`、`PASS`，退出码 0；核心库与钩子未改动。

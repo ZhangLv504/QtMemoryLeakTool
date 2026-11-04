@@ -43,3 +43,4 @@ find_package(Qt5 5.15.2 EXACT REQUIRED COMPONENTS Core Gui Widgets)
 # 阶段二新增 Qt 界面时，只需在这里追加一行 add_subdirectory(demo/phase2)。
 add_subdirectory(memtrack_core)
 add_subdirectory(demo/phase1)
+add_subdirectory(demo/phase2)
