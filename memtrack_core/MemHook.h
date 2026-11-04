@@ -1,5 +1,5 @@
 // =============================================================================
-// 文件：src/core/MemHook.h
+// 文件：memtrack_core/MemHook.h
 // 项目：QtMemoryLeakTool / QtMemTracker
 // 阶段：阶段一 —— 底层内存泄漏拦截与日志落盘
 // 用途：把源码中的 new 表达式改写成带 __FILE__/__LINE__ 的 placement 调用，

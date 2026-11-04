@@ -1,5 +1,5 @@
 // =============================================================================
-// 文件：src/core/MemTrackerConfig.h
+// 文件：memtrack_core/MemTrackerConfig.h
 // 项目：QtMemoryLeakTool / QtMemTracker
 // 阶段：阶段一 —— 底层内存泄漏拦截与日志落盘
 // 用途：跟踪器的编译期配置。所有宏均可由 CMake 覆盖，本文件只提供默认值，

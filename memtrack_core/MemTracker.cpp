@@ -1,5 +1,5 @@
 // =============================================================================
-// 文件：src/core/MemTracker.cpp
+// 文件：memtrack_core/MemTracker.cpp
 // 项目：QtMemoryLeakTool / QtMemTracker
 // 阶段：阶段一 —— 底层内存泄漏拦截与日志落盘
 // 用途：替换全局 operator new/delete，把每次分配的 <地址, 大小, 文件, 行号>

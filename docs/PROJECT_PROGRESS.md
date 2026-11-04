@@ -62,20 +62,22 @@
 ### 2. 目录与构建目标结构
 
 ```
-src/core/MemTrackerConfig.h   编译期常量
-src/core/MemTracker.h         公开 API（不含 new 宏）
-src/core/MemTracker.cpp       全局钩子 + 静态表 + 落盘
-src/core/MemHook.h            new 宏开关（必须最后 include）
-demo/phase1/main.cpp          阶段一验证入口（include MemHook.h）
-demo/phase1/plain_new.cpp     不包含宏的 TU，验证全局钩子与 file=<unknown>
+memtrack_core/MemTrackerConfig.h   编译期常量
+memtrack_core/MemTracker.h         公开 API（不含 new 宏）
+memtrack_core/MemTracker.cpp       全局钩子 + 静态表 + 落盘
+memtrack_core/MemHook.h            new 宏开关（必须最后 include）
+demo/phase1/main.cpp               阶段一验证入口（include MemHook.h）
+demo/phase1/plain_new.cpp          不包含宏的 TU，验证全局钩子与 file=<unknown>
 ```
 
-CMake 改造（替换现有"GLOB 单目标"结构）：
-- 新增静态库 `memtrack_core`：`MemTracker.cpp`，`PUBLIC` include `src/core`，`cxx_std_17`。
-- 新增可执行 `Phase1Demo`：`demo/phase1/*.cpp` + `memtrack_core`，MSVC 加 `/FC`（保证 `__FILE__` 为绝对路径）。
+CMake 结构（子目录自治，根文件只做目标编排）：
+- 根 `CMakeLists.txt`：仅 `project()`、C++17、全局编译选项（`/utf-8`、`/Zc:__cplusplus`）、`find_package(Qt5)`，以及 `add_subdirectory(memtrack_core)`、`add_subdirectory(demo/phase1)` 两条编排语句。
+- `memtrack_core/CMakeLists.txt`：定义静态库 `memtrack_core`（`MemTracker.cpp`、`PUBLIC` include 本目录、`cxx_std_17`、`MEMTRACK_TABLE_CAPACITY` cache 变量注入、`PUBLIC` 链接 `Threads::Threads`、关闭 AUTOMOC/AUTOUIC/AUTORCC）。
+- `demo/phase1/CMakeLists.txt`：定义 `Phase1Demo`（`main.cpp` + `plain_new.cpp`），链接 `memtrack_core` 与 `Threads::Threads`，MSVC 加 `/FC`（保证 `__FILE__` 为绝对路径）。
 - 移除 `src/main.cpp`（当前是 `std::vector` 练习代码，不属于任何阶段功能，内容不迁移）。
-- 原 `QtMemoryLeakTool` 单目标撤除；阶段二再新增 `Phase2App` 链接 `Qt5::Widgets` + `memtrack_core`。
+- 原 `QtMemoryLeakTool` 单目标撤除；阶段二新增 `demo/phase2/CMakeLists.txt`，根文件只追加一行 `add_subdirectory(demo/phase2)`。
 - 阶段一 demo 不链接 Qt，但项目仍 `find_package(Qt5)`（阶段二依赖）。
+- 根文件不设置 `CMAKE_AUTOMOC/AUTOUIC/AUTORCC`；阶段二 Qt 目标在自身子目录内开启，不波及核心库与阶段一 demo。
 
 ### 3. 组件职责
 
@@ -316,9 +318,10 @@ logs/
 
 ### 已完成事项
 
-- 新增核心源码：`src/core/MemTrackerConfig.h`、`MemTracker.h`、`MemTracker.cpp`、`MemHook.h`。
+- 新增核心源码：`memtrack_core/MemTrackerConfig.h`、`MemTracker.h`、`MemTracker.cpp`、`MemHook.h`。
 - 新增阶段一验证入口：`demo/phase1/main.cpp`、`demo/phase1/plain_new.cpp`。
 - 构建改造：静态库 `memtrack_core`（关闭 AUTOMOC/AUTOUIC/AUTORCC，不依赖 Qt）+ 可执行 `Phase1Demo`；移除练习用 `src/main.cpp`。
+- CMake 改为子目录自治：根 `CMakeLists.txt` 只保留项目级设置与 `add_subdirectory` 编排，核心库目录与目标同名（`memtrack_core/`，原 `src/core/` 及空的 `src/` 已移除），`memtrack_core/CMakeLists.txt` 与 `demo/phase1/CMakeLists.txt` 各自声明目标、依赖与选项；`MEMTRACK_TABLE_CAPACITY` 的 cache 变量随核心库目录声明。
 - 全局钩子按契约覆盖：普通/数组/sized/nothrow/宏 placement/C++17 aligned 的分配与释放。
 - 日志 v1 落盘：manual 与 atexit 两条路径均验证。
 - 日志自动布局（8.1）：`setPhaseName("phase1")` 后由 `start()` 创建 `logs/phase1/<yyyyMMdd-HHmmss>_pid<pid>/`，手动写 `manual-N.log`、退出写 `run.log`；显式路径模式保持优先。
@@ -336,6 +339,7 @@ logs/
 ### 验证结果
 
 - 构建：`cmake -S . -B build -G "Visual Studio 17 2022" -A x64` + `cmake --build build --config RelWithDebInfo`，成功生成 `Phase1Demo.exe`。
+- CMake 拆分为子目录自治后重新配置构建通过，产物位置变为 `build/memtrack_core/RelWithDebInfo/memtrack_core.lib` 与 `build/demo/phase1/RelWithDebInfo/Phase1Demo.exe`，运行结果与拆分前一致。
 - 运行：`live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`，输出 `PASS`，退出码 0。
 - `logs/phase1/<yyyyMMdd-HHmmss>_pid<pid>/manual-1.log` 与同目录 `run.log`：`dump_reason` 分别为 `manual` / `atexit`，各 5 条块记录；两个工作线程 `tid` 不同；无宏 TU 的块为 `file=<unknown> line=0`。
 - 连续两次运行生成两个独立的时间戳运行目录，`manual-N.log` 编号与 `run.log` 命名符合 8.1。

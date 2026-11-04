@@ -1,5 +1,5 @@
 // =============================================================================
-// 文件：src/core/MemTracker.h
+// 文件：memtrack_core/MemTracker.h
 // 项目：QtMemoryLeakTool / QtMemTracker
 // 阶段：阶段一 —— 底层内存泄漏拦截与日志落盘
 // 用途：内存跟踪器的公开 API。头文件只暴露控制与查询接口，不定义 new 宏、
