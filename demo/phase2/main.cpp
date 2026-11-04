@@ -7,15 +7,17 @@
 //       同时接入阶段一跟踪器（阶段名 phase2，UI 构建完成后再 start）。
 //
 // 运行方式：
-//   Phase2App                 显示主窗口，点击“刷新对象树”重建快照；
-//   Phase2App --self-check    使用 offscreen 平台自动校验对象树拓扑与日志集成，
-//                             输出 PASS/FAIL 并以 0/1 退出（供构建后验证）。
+//   Phase2App                 显示主窗口：上方对象树，下方泄漏日志面板；
+//   Phase2App --self-check    使用 offscreen 平台自动校验对象树拓扑、日志解析
+//                             与跟踪器集成，输出 PASS/FAIL 并以 0/1 退出。
 //
 // 约束：本文件不包含 MemHook.h（避免 new 宏侵入 Qt 头文件）；Qt 代码中的分配
 //       仍由全局钩子记录，位置为 file=<unknown> line=0。
 // =============================================================================
 #include <QAbstractItemModel>
 #include <QApplication>
+#include <QComboBox>
+#include <QDir>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -26,6 +28,8 @@
 #include <QSplitter>
 #include <QStatusBar>
 #include <QStringList>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QTimer>
 #include <QTreeView>
 #include <QVBoxLayout>
@@ -35,10 +39,98 @@
 #include <cstdio>
 #include <cstring>
 
+#include "LeakLogReader.h"
 #include "MemTracker.h"
+#include "MemTrackerConfig.h"
 #include "ObjectTreeModel.h"
 
 namespace {
+
+// 日志根目录：与跟踪器自动布局一致（<MEMTRACK_LOG_ROOT>/phase2）。
+QString logDirectory()
+{
+    return QStringLiteral(MEMTRACK_LOG_ROOT "/phase2");
+}
+
+// 解析指定日志并填充摘要与块表格；失败时清空表格并显示原因。
+void showLogInUi(const QString& path, QLabel* summary, QTableWidget* table)
+{
+    LeakLogData data;
+    QString error;
+    if (!leaklog::readLog(path, data, &error))
+    {
+        summary->setText(QStringLiteral("加载失败：%1").arg(error));
+        table->setRowCount(0);
+        return;
+    }
+
+    summary->setText(
+        QStringLiteral("文件：%1 ｜ reason=%2 ｜ live_blocks=%3 ｜ live_bytes=%4 ｜ "
+                       "unknown_frees=%5 ｜ table_overflows=%6 ｜ 块数=%7")
+            .arg(QDir::current().relativeFilePath(path),
+                 data.header.value(QStringLiteral("dump_reason"), QStringLiteral("?")),
+                 data.header.value(QStringLiteral("live_blocks"), QStringLiteral("?")),
+                 data.header.value(QStringLiteral("live_bytes"), QStringLiteral("?")),
+                 data.header.value(QStringLiteral("unknown_frees"), QStringLiteral("?")),
+                 data.header.value(QStringLiteral("table_overflows"), QStringLiteral("?")),
+                 QString::number(data.blocks.size())));
+
+    table->setSortingEnabled(false);
+    table->setRowCount(data.blocks.size());
+    for (int row = 0; row < data.blocks.size(); ++row)
+    {
+        const LeakBlock& block = data.blocks.at(row);
+        const QStringList values = {
+            QString::number(block.seq),
+            block.address,
+            QString::number(block.size),
+            QString::number(block.tid),
+            QString::number(block.align),
+            QString::number(block.line),
+            block.file};
+        for (int column = 0; column < values.size(); ++column)
+        {
+            auto* item = new QTableWidgetItem(values.at(column));
+            item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+            table->setItem(row, column, item);
+        }
+    }
+}
+
+// 重新扫描日志目录并加载最近一份（或 preferredPath 指定的文件）。
+void refreshLogList(QComboBox* selector, QLabel* summary, QTableWidget* table,
+                    const QString& preferredPath = QString())
+{
+    const QStringList files = leaklog::listLogFiles(logDirectory());
+    selector->blockSignals(true);
+    selector->clear();
+    for (const QString& path : files)
+    {
+        selector->addItem(QDir::current().relativeFilePath(path), path);
+    }
+    selector->blockSignals(false);
+
+    if (files.isEmpty())
+    {
+        summary->setText(
+            QStringLiteral("暂无日志：点击“立即导出并加载”后在 %1 下生成")
+                .arg(logDirectory()));
+        table->setRowCount(0);
+        return;
+    }
+
+    int index = 0;
+    if (!preferredPath.isEmpty())
+    {
+        const int found = selector->findData(preferredPath);
+        if (found >= 0)
+        {
+            index = found;
+        }
+    }
+    selector->setCurrentIndex(index);
+    showLogInUi(selector->itemData(index).toString(), summary, table);
+}
 
 // 搭建阶段二测试窗口。
 // window：栈上主窗口，作为对象树根；函数内创建的控件都挂在它下面。
@@ -55,12 +147,17 @@ QTreeView* buildTestWindow(QMainWindow& window, ObjectTreeModel& model)
     central->setObjectName(QStringLiteral("centralWidget"));
     window.setCentralWidget(central);
 
-    auto* rootLayout = new QHBoxLayout(central);
+    auto* rootLayout = new QVBoxLayout(central);
     rootLayout->setContentsMargins(8, 8, 8, 8);
 
-    auto* splitter = new QSplitter(Qt::Horizontal, central);
+    // 垂直分割：上方对象树与测试面板，下方泄漏日志查看。
+    auto* layoutSplitter = new QSplitter(Qt::Vertical, central);
+    layoutSplitter->setObjectName(QStringLiteral("layoutSplitter"));
+    rootLayout->addWidget(layoutSplitter);
+
+    auto* splitter = new QSplitter(Qt::Horizontal, layoutSplitter);
     splitter->setObjectName(QStringLiteral("mainSplitter"));
-    rootLayout->addWidget(splitter);
+    layoutSplitter->addWidget(splitter);
 
     // 左侧：对象树视图。模型指针在窗口存活期间始终有效。
     auto* view = new QTreeView(splitter);
@@ -161,6 +258,75 @@ QTreeView* buildTestWindow(QMainWindow& window, ObjectTreeModel& model)
     window.statusBar()->showMessage(
         QStringLiteral("对象树为快照式展示，结构变化后请点击刷新"));
 
+    // 下方：泄漏日志面板（阶段二扩展）。读取 logs/phase2/**/*.log 的 v1 内容。
+    auto* logGroup = new QGroupBox(QStringLiteral("泄漏日志（v1）"), layoutSplitter);
+    logGroup->setObjectName(QStringLiteral("logGroup"));
+    auto* logLayout = new QVBoxLayout(logGroup);
+
+    auto* logToolbar = new QHBoxLayout();
+    auto* logSelector = new QComboBox(logGroup);
+    logSelector->setObjectName(QStringLiteral("logSelector"));
+    logSelector->setMinimumContentsLength(30);
+    logSelector->setSizeAdjustPolicy(
+        QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    auto* reloadLogsButton = new QPushButton(QStringLiteral("刷新列表"), logGroup);
+    reloadLogsButton->setObjectName(QStringLiteral("reloadLogsButton"));
+    auto* loadLogButton = new QPushButton(QStringLiteral("加载选中"), logGroup);
+    loadLogButton->setObjectName(QStringLiteral("loadLogButton"));
+    auto* dumpLogButton = new QPushButton(QStringLiteral("立即导出并加载"), logGroup);
+    dumpLogButton->setObjectName(QStringLiteral("dumpLogButton"));
+    logToolbar->addWidget(new QLabel(QStringLiteral("日志："), logGroup));
+    logToolbar->addWidget(logSelector, 1);
+    logToolbar->addWidget(reloadLogsButton);
+    logToolbar->addWidget(loadLogButton);
+    logToolbar->addWidget(dumpLogButton);
+    logLayout->addLayout(logToolbar);
+
+    auto* logSummary = new QLabel(QStringLiteral("暂无日志"), logGroup);
+    logSummary->setObjectName(QStringLiteral("logSummary"));
+    logSummary->setWordWrap(true);
+    logLayout->addWidget(logSummary);
+
+    auto* logTable = new QTableWidget(0, 7, logGroup);
+    logTable->setObjectName(QStringLiteral("logTable"));
+    logTable->setHorizontalHeaderLabels(
+        QStringList() << QStringLiteral("序号") << QStringLiteral("地址")
+                      << QStringLiteral("大小") << QStringLiteral("线程")
+                      << QStringLiteral("对齐") << QStringLiteral("行号")
+                      << QStringLiteral("文件"));
+    logTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    logTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    logTable->setAlternatingRowColors(true);
+    logTable->verticalHeader()->setVisible(false);
+    logTable->horizontalHeader()->setStretchLastSection(true);
+    logLayout->addWidget(logTable, 1);
+
+    layoutSplitter->setStretchFactor(0, 3);
+    layoutSplitter->setStretchFactor(1, 2);
+
+    QObject::connect(reloadLogsButton, &QPushButton::clicked, &window,
+                     [logSelector, logSummary, logTable]()
+                     {
+                         refreshLogList(logSelector, logSummary, logTable);
+                     });
+    QObject::connect(loadLogButton, &QPushButton::clicked, &window,
+                     [logSelector, logSummary, logTable]()
+                     {
+                         showLogInUi(logSelector->currentData().toString(),
+                                     logSummary, logTable);
+                     });
+    QObject::connect(dumpLogButton, &QPushButton::clicked, &window,
+                     [&window, logSelector, logSummary, logTable]()
+                     {
+                         const int rows = memtrack::dumpLeaks();
+                         refreshLogList(logSelector, logSummary, logTable);
+                         window.statusBar()->showMessage(
+                             QStringLiteral("已导出日志，块数=%1").arg(rows), 3000);
+                     });
+
+    // 启动时加载最近一份日志（可能来自上一次运行）。
+    refreshLogList(logSelector, logSummary, logTable);
+
     // 以主窗口为根重建一次快照。窗口在 main 栈上，生命周期覆盖模型使用期。
     model.setRootObject(&window);
     return view;
@@ -245,9 +411,9 @@ bool containsName(const QAbstractItemModel& model,
     return false;
 }
 
-// 自校验：验证根节点、必需对象名、嵌套拓扑、搜索高亮、展开/滚动条与落盘。
-// 只通过模型/视图公共接口检查，不访问私有实现。
-bool runSelfCheck(QTreeView& view, ObjectTreeModel& model)
+// 自校验：验证根节点、必需对象名、嵌套拓扑、搜索高亮、展开/滚动条、
+// 日志面板与跟踪器落盘。只通过模型/视图公共接口检查，不访问私有实现。
+bool runSelfCheck(QTreeView& view, ObjectTreeModel& model, QMainWindow& window)
 {
     const QModelIndex root = model.index(0, 0);
     if (!root.isValid()
@@ -343,8 +509,35 @@ bool runSelfCheck(QTreeView& view, ObjectTreeModel& model)
     const int manualRows = memtrack::dumpLeaks();
     const memtrack::Stats stats = memtrack::stats();
 
+    // 日志面板：导出后刷新列表，解析最新日志并核对块数与表格行数。
+    auto* logSelector = window.findChild<QComboBox*>(QStringLiteral("logSelector"));
+    auto* logSummary = window.findChild<QLabel*>(QStringLiteral("logSummary"));
+    auto* logTable = window.findChild<QTableWidget*>(QStringLiteral("logTable"));
+    bool logOk = false;
+    if (logSelector != nullptr && logSummary != nullptr && logTable != nullptr)
+    {
+        refreshLogList(logSelector, logSummary, logTable);
+        LeakLogData data;
+        QString error;
+        const QString path = logSelector->currentData().toString();
+        logOk = leaklog::readLog(path, data, &error)
+             && data.header.value(QStringLiteral("dump_reason"))
+                    == QStringLiteral("manual")
+             && data.blocks.size() == manualRows
+             && logTable->rowCount() == manualRows;
+        if (!logOk)
+        {
+            std::fprintf(stderr, "self-check: log panel mismatch (%s)\n",
+                         error.toUtf8().constData());
+        }
+    }
+    else
+    {
+        std::fprintf(stderr, "self-check: log panel widgets not found\n");
+    }
+
     std::printf("nodes=%d max_depth=%d expand=%s scrollbars=%s columns=%s "
-                "search=%s live_blocks=%llu live_bytes=%llu unknown_frees=%llu "
+                "search=%s log=%s live_blocks=%llu live_bytes=%llu unknown_frees=%llu "
                 "table_overflows=%llu manual_rows=%d\n",
                 nodeCount,
                 maxDepth,
@@ -352,6 +545,7 @@ bool runSelfCheck(QTreeView& view, ObjectTreeModel& model)
                 scrollOk ? "ok" : "fail",
                 columnsOk ? "ok" : "fail",
                 (searchOk && clearOk) ? "ok" : "fail",
+                logOk ? "ok" : "fail",
                 static_cast<unsigned long long>(stats.liveBlocks),
                 static_cast<unsigned long long>(stats.liveBytes),
                 static_cast<unsigned long long>(stats.unknownFrees),
@@ -359,7 +553,8 @@ bool runSelfCheck(QTreeView& view, ObjectTreeModel& model)
                 manualRows);
 
     const bool ok = namesOk && nestedOk && countOk && expandOk && scrollOk
-                 && columnsOk && searchOk && clearOk && manualRows >= 0;
+                 && columnsOk && searchOk && clearOk && logOk
+                 && manualRows >= 0;
     std::printf(ok ? "PASS\n" : "FAIL\n");
     return ok;
 }
@@ -415,10 +610,10 @@ int main(int argc, char** argv)
 
     // 自校验：等事件循环首轮完成后再检查，确保窗口已完成构建、显示与展开。
     QTimer::singleShot(0, &window,
-                       [&app, &model, view]()
+                       [&app, &model, &window, view]()
                        {
                            view->expandAll();
-                           const bool ok = runSelfCheck(*view, model);
+                           const bool ok = runSelfCheck(*view, model, window);
                            app.exit(ok ? 0 : 1);
                        });
     return app.exec();

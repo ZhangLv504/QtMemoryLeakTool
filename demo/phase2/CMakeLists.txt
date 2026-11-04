@@ -18,6 +18,8 @@ add_executable(Phase2App
     main.cpp
     ObjectTreeModel.cpp
     ObjectTreeModel.h
+    LeakLogReader.cpp
+    LeakLogReader.h
 )
 
 target_link_libraries(Phase2App PRIVATE

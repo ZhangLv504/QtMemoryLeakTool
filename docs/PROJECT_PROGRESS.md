@@ -569,3 +569,108 @@ mainWindow
 - `Phase2App.exe --self-check`（offscreen）：`nodes=46 max_depth=7 expand=ok scrollbars=ok columns=ok search=ok live_blocks=1 live_bytes=40 unknown_frees=0 table_overflows=0 manual_rows=1`、`PASS`，退出码 0。
 - 日志仍为 v1：`logs/phase2/<运行目录>/manual-1.log`（`dump_reason=manual`）与 `run.log`（`dump_reason=atexit`）。
 - 回归：`Phase1Demo` 输出 `live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`、`PASS`，退出码 0；核心库与钩子未改动。
+
+## 阶段二扩展：泄漏日志查看（架构与接口契约）
+
+> 状态：架构已冻结，按本节实现后回写完成记录。本扩展沿用阶段一日志 v1 与阶段二 `Phase2App`，不新增可执行目标，不改动钩子。
+
+### 1. 范围与非目标
+
+**范围内**
+- 在 `Phase2App` 右侧下方增加日志面板：日志文件选择、刷新列表、加载选中、立即导出并加载。
+- 解析 `MEMTRACK_LOG_ROOT/phase2/**/*.log` 的 v1 内容，展示头部统计与块表格（序号/地址/大小/线程/对齐/行号/文件）。
+- 启动时自动加载最近一份日志；`--self-check` 校验解析结果与 `dumpLeaks()` 返回值一致。
+
+**非目标**
+- 不修改日志格式、跟踪器 API 或全局钩子。
+- 不支持 v1 之外的格式、压缩日志或远程日志。
+- 不自动监听文件变化；列表与内容由按钮/导出动作刷新。
+
+### 2. 组件与接口
+
+```
+demo/phase2/LeakLogReader.h    日志发现与 v1 解析接口
+demo/phase2/LeakLogReader.cpp  实现
+demo/phase2/main.cpp           日志面板 UI 与自校验扩展
+```
+
+```cpp
+struct LeakBlock {
+    quint64 seq;
+    QString address;   // 0x%016llX 原样字符串
+    quint64 size;
+    quint32 tid;
+    quint32 align;
+    int     line;
+    QString file;      // 行尾原始值，允许空格；未知为 <unknown>
+};
+
+struct LeakLogData {
+    QHash<QString, QString> header;  // 头部 key=value
+    QVector<LeakBlock> blocks;
+};
+
+namespace leaklog {
+// 递归扫描 rootDir 下所有 *.log，按修改时间倒序返回绝对路径。
+QStringList listLogFiles(const QString& rootDir);
+// 解析 v1 日志；首行必须为 "# qtmemtrack leak report v1"，遇到 "# end" 结束。
+// 成功返回 true；失败返回 false，并可通过 error 获取原因。
+bool readLog(const QString& path, LeakLogData& out, QString* error = nullptr);
+}
+```
+
+- 块行解析使用固定正则：`^block seq=(\d+) addr=(0x[0-9A-Fa-f]+) size=(\d+) tid=(\d+) align=(\d+) line=(-?\d+) file=(.*)$`。
+- 其他含 `=` 的行视为头部键；空行与无法识别的行忽略；缺失首行或 `# end` 判为不完整日志。
+- 列表根目录由 `MEMTRACK_LOG_ROOT` 宏拼接阶段名 `phase2` 得到，与跟踪器自动布局保持一致。
+
+### 3. 界面结构
+
+```
+centralWidget
+└─ layoutSplitter（垂直）
+   ├─ mainSplitter（现有：对象树 + 测试面板）
+   └─ logGroup
+      ├─ logSelector / reloadLogsButton / loadLogButton / dumpLogButton
+      ├─ logSummary（文件路径与头部统计）
+      └─ logTable（7 列：序号/地址/大小/线程/对齐/行号/文件）
+```
+
+- `dumpLogButton` 调用 `memtrack::dumpLeaks()` 后刷新列表并加载最新日志。
+- 日志表格只读，使用只读选择模式；文件列自动拉伸，其余列可拖动。
+- 日志读取发生在 GUI 线程，不参与分配钩子的临界区。
+
+### 4. 自校验扩展
+
+- `--self-check` 在调用 `dumpLeaks()` 后刷新日志列表，解析最新日志并要求：
+  1. `dump_reason=manual`；
+  2. 解析出的块数等于 `dumpLeaks()` 返回值；
+  3. `logTable` 行数等于块数。
+- 输出新增 `log=ok|fail`，与既有 expand/scrollbars/columns/search 检查一起决定退出码。
+
+### 5. 已知限制
+
+- 仅解析自动布局下的 `logs/phase2`；显式 `setLogPath` 生成的文件不在列表中。
+- 列表按文件修改时间排序，同一时间戳下的顺序不保证稳定。
+- 日志较大时一次性读入内存并填充表格，未做分页或流式加载。
+
+### 阶段二扩展完成记录（2026-11-04）
+
+#### 已完成事项
+
+- 新增 `demo/phase2/LeakLogReader.h` / `LeakLogReader.cpp`：递归发现 `logs/phase2/**/*.log`，按修改时间倒序；按 v1 正则解析头部与块行，缺失报告头或 `# end` 判为失败。
+- `Phase2App` 布局改为垂直分割：上方保留对象树与测试面板，下方新增日志面板（`logGroup`）。
+- 日志面板包含：日志下拉框、刷新列表、加载选中、立即导出并加载、头部统计摘要、7 列只读块表格；启动时自动加载最近一份日志。
+- `--self-check` 新增日志检查：`dumpLeaks()` 后用解析器读取最新日志，要求 `dump_reason=manual`、解析块数与返回值一致、表格行数一致。
+- CMake 目标源文件追加 `LeakLogReader.cpp/.h`；未改动核心库、钩子与日志格式。
+
+#### 验证结果
+
+- 构建：VS 2022 生成器配置并 `RelWithDebInfo` 构建成功，生成 `build/demo/phase2/RelWithDebInfo/Phase2App.exe`。
+- 自校验：`nodes=103 max_depth=9 expand=ok scrollbars=ok columns=ok search=ok log=ok live_blocks=1 live_bytes=48 unknown_frees=0 table_overflows=0 manual_rows=1`、`PASS`，退出码 0。
+- 节点数由 46 增至 103 属预期：日志面板的 `QGroupBox`、下拉框、按钮、表格及其内部子对象都进入了 QObject 对象树。
+- `logs/phase2/<运行目录>/manual-1.log` 被正确解析：`dump_reason=manual`，1 条块与表格行数一致；`run.log` 仍由 atexit 生成。
+- 回归：`Phase1Demo` 输出 `live_blocks=5 live_bytes=128 unknown_frees=1 table_overflows=0 manual_rows=5`、`PASS`，退出码 0。
+
+#### 已知限制
+
+沿用扩展契约第 5 节；补充：本次运行的 `run.log` 在进程退出时才写入，界面只能在下一次启动或手动导出后看到它。
