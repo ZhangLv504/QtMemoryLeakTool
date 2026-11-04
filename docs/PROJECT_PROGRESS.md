@@ -503,7 +503,7 @@ mainWindow
 | 对象树根与拓扑 | 顶层为 `mainWindow`；`nestedButton` 的祖先链包含 `nestedPanel` |
 | 刷新 | 点击 `refreshButton` 后模型重置并重新展开 |
 | 默认展开与滚动条 | 启动后对象树全部展开；水平、垂直滚动条常驻 |
-| 列宽可调 | 四列均为 `QHeaderView::Interactive`，可拖动列边界改变宽度（初始 220/140/80/160） |
+| 列宽可调 | 四列均为 `QHeaderView::Interactive`，可拖动列边界改变宽度（初始 220/240/120/260） |
 | 搜索高亮 | 输入对象名子串后，命中行 4 列显示淡蓝背景；清空输入恢复默认底色 |
 | 手动落盘 | `logs/phase2/<运行目录>/manual-1.log`，`dump_reason=manual` |
 | 退出落盘 | 同一运行目录 `run.log`，`dump_reason=atexit` |
@@ -559,7 +559,7 @@ mainWindow
 
 - 默认展开：`view->expandAll()` 移到 `window.show()` 之后执行（QTreeView 需可见后完成完整布局），启动即全展开；刷新按钮仍会重建快照并重新展开。
 - 滚动条：对象树视图的水平、垂直滚动条策略均设为 `Qt::ScrollBarAlwaysOn`。
-- 列宽可调：四列尺寸模式统一为 `QHeaderView::Interactive`（初始宽度 220/140/80/160），用户可拖动列边界，不再被 `Stretch`/`ResizeToContents` 锁定。
+- 列宽可调：四列尺寸模式统一为 `QHeaderView::Interactive`（初始宽度 220/240/120/260），用户可拖动列边界，不再被 `Stretch`/`ResizeToContents` 锁定。
 - 搜索：右侧面板新增 `searchEdit`（QLineEdit，实时触发）；模型新增 `setSearchText()` / `searchText()`，按 `objectName` 子串、不区分大小写匹配，命中行 4 列使用淡蓝色背景 `QColor(204,229,255)`，空文本清除高亮。
 - 搜索只递归发送 `Qt::BackgroundRole` 的 `dataChanged`，不重建快照，展开状态与选中项不丢失。
 - `--self-check` 扩展校验默认展开、双滚动条常驻、四列可拖动、搜索命中/清除。

@@ -79,9 +79,9 @@ QTreeView* buildTestWindow(QMainWindow& window, ObjectTreeModel& model)
         view->header()->setSectionResizeMode(column, QHeaderView::Interactive);
     }
     view->header()->resizeSection(0, 220);
-    view->header()->resizeSection(1, 140);
-    view->header()->resizeSection(2, 80);
-    view->header()->resizeSection(3, 160);
+    view->header()->resizeSection(1, 240);
+    view->header()->resizeSection(2, 120);
+    view->header()->resizeSection(3, 260);
 
     // 右侧：测试控件区，故意构造两级父子关系：
     // testGroupBox -> nestedPanel -> nestedButton。
